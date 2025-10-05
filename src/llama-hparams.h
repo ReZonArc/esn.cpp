@@ -136,6 +136,13 @@ struct llama_hparams {
 
     bool ssm_dt_b_c_rms = false;
 
+    // for Echo State Networks
+    uint32_t esn_reservoir_size   = 0;
+    float    esn_spectral_radius  = 0.95f;
+    float    esn_sparsity         = 0.1f;
+    float    esn_leaking_rate     = 1.0f;
+    float    esn_input_scaling    = 1.0f;
+
     float f_clamp_kqv      = 0.0f;
     float f_max_alibi_bias = 0.0f;
     float f_logit_scale    = 0.0f;
