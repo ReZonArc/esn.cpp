@@ -2050,6 +2050,21 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_ESN:
+            {
+                ml.get_key(LLM_KV_ESN_RESERVOIR_SIZE,   hparams.esn_reservoir_size);
+                ml.get_key(LLM_KV_ESN_SPECTRAL_RADIUS,  hparams.esn_spectral_radius);
+                ml.get_key(LLM_KV_ESN_SPARSITY,         hparams.esn_sparsity);
+                ml.get_key(LLM_KV_ESN_LEAKING_RATE,     hparams.esn_leaking_rate);
+                ml.get_key(LLM_KV_ESN_INPUT_SCALING,    hparams.esn_input_scaling);
+
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+
+                switch (hparams.n_layer) {
+                    case 1: type = LLM_TYPE_SMALL; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         default: throw std::runtime_error("unsupported model architecture");
     }
 
@@ -5973,6 +5988,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.attn_k_norm   = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), { n_embd_head_k }, 0);
                         layer.attn_k_norm_b = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "bias",   i), { n_embd_head_k }, TENSOR_NOT_REQUIRED);
                     }
+                } break;
+            case LLM_ARCH_ESN:
+                {
+                    const int64_t reservoir_size = hparams.esn_reservoir_size;
+
+                    // ESN architecture tensors
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+                    
+                    // Input weights: projects input embeddings to reservoir  
+                    layers.resize(1); // ESN uses a single "layer" to store the weights
+                    layers[0].wq = create_tensor(tn(LLM_TENSOR_ESN_INPUT_WEIGHTS, "weight"), {reservoir_size, n_embd}, 0);
+                    
+                    // Reservoir weights: recurrent connections within reservoir
+                    layers[0].wk = create_tensor(tn(LLM_TENSOR_ESN_RESERVOIR_WEIGHTS, "weight"), {reservoir_size, reservoir_size}, 0);
+                    
+                    // Output normalization and projection
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {reservoir_size}, 0);
+                    
+                    // Output weights: projects reservoir states to vocabulary
+                    output = create_tensor(tn(LLM_TENSOR_ESN_OUTPUT_WEIGHTS, "weight"), {n_vocab, reservoir_size}, 0);
                 } break;
             default:
                 throw std::runtime_error("unknown architecture");
@@ -19300,6 +19335,75 @@ struct llm_build_apertus : public llm_graph_context {
     }
 };
 
+struct llm_build_esn : public llm_graph_context_mamba {
+    llm_build_esn(const llama_model & model, const llm_graph_params & params) : llm_graph_context_mamba(params) {
+        ggml_tensor * cur;
+        ggml_tensor * inpL;
+
+        const int64_t reservoir_size = hparams.esn_reservoir_size;
+        const float spectral_radius = hparams.esn_spectral_radius;
+        const float leaking_rate = hparams.esn_leaking_rate;
+
+        // {n_embd, n_tokens}
+        inpL = build_inp_embd(model.tok_embd);
+
+        // ESN state management using recurrent memory system
+        auto * rs_inp = build_rs_inp();
+
+        ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+        // Project input embeddings to reservoir space
+        // W_in * input: {reservoir_size, n_embd} * {n_embd, n_tokens} -> {reservoir_size, n_tokens}
+        cur = ggml_mul_mat(ctx0, model.layers[0].wq, inpL);
+        cur = ggml_scale_inplace(ctx0, cur, hparams.esn_input_scaling);
+        cb(cur, "esn_input_proj", -1);
+
+        // Apply reservoir dynamics
+        // This is the core ESN computation: x(t+1) = (1-α)*x(t) + α*tanh(W_res*x(t) + W_in*u(t))
+        // where α is the leaking rate and W_res has spectral radius < 1
+        
+        // Get current reservoir state from recurrent memory
+        ggml_tensor * reservoir_state = build_rs(rs_inp, model.layers[0].wk, 
+                                                  static_cast<int32_t>(reservoir_size), 
+                                                  static_cast<int32_t>(n_tokens));
+        
+        // W_res * x(t): {reservoir_size, reservoir_size} * {reservoir_size, n_tokens} -> {reservoir_size, n_tokens}
+        ggml_tensor * reservoir_recurrent = ggml_mul_mat(ctx0, model.layers[0].wk, reservoir_state);
+        cb(reservoir_recurrent, "esn_reservoir_recurrent", -1);
+        
+        // Add input projection: W_res*x(t) + W_in*u(t)
+        ggml_tensor * reservoir_input = ggml_add(ctx0, reservoir_recurrent, cur);
+        cb(reservoir_input, "esn_reservoir_input", -1);
+        
+        // Apply nonlinearity: tanh(W_res*x(t) + W_in*u(t))
+        ggml_tensor * reservoir_activated = ggml_tanh(ctx0, reservoir_input);
+        cb(reservoir_activated, "esn_reservoir_activated", -1);
+        
+        // Leaky integration: x(t+1) = (1-α)*x(t) + α*tanh(...)
+        ggml_tensor * leaky_old = ggml_scale_inplace(ctx0, reservoir_state, 1.0f - leaking_rate);
+        ggml_tensor * leaky_new = ggml_scale_inplace(ctx0, reservoir_activated, leaking_rate);
+        cur = ggml_add(ctx0, leaky_old, leaky_new);
+        cb(cur, "esn_reservoir_next", -1);
+
+        if (inp_out_ids) {
+            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        }
+
+        // Apply output normalization
+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+
+        // Project reservoir states to output vocabulary
+        // W_out * reservoir_states: {n_vocab, reservoir_size} * {reservoir_size, n_tokens} -> {n_vocab, n_tokens}
+        cur = ggml_mul_mat(ctx0, model.output, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
+};
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -19834,6 +19938,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_apertus>(*this, params);
             } break;
+        case LLM_ARCH_ESN:
+            {
+                llm = std::make_unique<llm_build_esn>(*this, params);
+            } break;
         default:
             GGML_ABORT("fatal error");
     }
@@ -20042,6 +20150,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GROVEMOE:
         case LLM_ARCH_APERTUS:
             return LLAMA_ROPE_TYPE_NEOX;
+
+        case LLM_ARCH_ESN:
+            return LLAMA_ROPE_TYPE_NONE;
 
         case LLM_ARCH_QWEN2VL:
             return LLAMA_ROPE_TYPE_MROPE;

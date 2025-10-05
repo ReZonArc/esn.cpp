@@ -100,6 +100,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_SEED_OSS,         "seed_oss"         },
     { LLM_ARCH_GROVEMOE,         "grovemoe"         },
     { LLM_ARCH_APERTUS,          "apertus"          },
+    { LLM_ARCH_ESN,              "esn"              },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -261,6 +262,12 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_XIELU_ALPHA_P,         "xielu.alpha_p"         },
     { LLM_KV_XIELU_BETA,            "xielu.beta"            },
     { LLM_KV_XIELU_EPS,             "xielu.eps"             },
+
+    { LLM_KV_ESN_RESERVOIR_SIZE,    "esn.reservoir_size"    },
+    { LLM_KV_ESN_SPECTRAL_RADIUS,   "esn.spectral_radius"   },
+    { LLM_KV_ESN_SPARSITY,          "esn.sparsity"          },
+    { LLM_KV_ESN_LEAKING_RATE,      "esn.leaking_rate"      },
+    { LLM_KV_ESN_INPUT_SCALING,     "esn.input_scaling"     },
 
     // deprecated
     { LLM_KV_TOKENIZER_PREFIX_ID, "tokenizer.ggml.prefix_token_id" },
@@ -2145,6 +2152,17 @@ static const std::map<llm_arch, std::map<llm_tensor, const char *>> LLM_TENSOR_N
         },
     },
     {
+        LLM_ARCH_ESN,
+        {
+            { LLM_TENSOR_TOKEN_EMBD,              "token_embd" },
+            { LLM_TENSOR_OUTPUT_NORM,             "output_norm" },
+            { LLM_TENSOR_OUTPUT,                  "output" },
+            { LLM_TENSOR_ESN_INPUT_WEIGHTS,       "esn_input_weights" },
+            { LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,   "esn_reservoir_weights" },
+            { LLM_TENSOR_ESN_OUTPUT_WEIGHTS,      "esn_output_weights" },
+        },
+    },
+    {
         LLM_ARCH_DREAM,
         {
             { LLM_TENSOR_TOKEN_EMBD,      "token_embd" },
@@ -2420,6 +2438,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_NEXTN_HNORM,                {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,     {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL}},
+    // ESN specific tensors
+    {LLM_TENSOR_ESN_INPUT_WEIGHTS,          {LLM_TENSOR_LAYER_INPUT, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_RESERVOIR_WEIGHTS,      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ESN_OUTPUT_WEIGHTS,         {LLM_TENSOR_LAYER_OUTPUT, GGML_OP_MUL_MAT}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -2480,6 +2502,7 @@ bool llm_arch_is_recurrent(const llm_arch & arch) {
         case LLM_ARCH_RWKV6QWEN2:
         case LLM_ARCH_RWKV7:
         case LLM_ARCH_ARWKV7:
+        case LLM_ARCH_ESN:
             return true;
         default:
             return false;
